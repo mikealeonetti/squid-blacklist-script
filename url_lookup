@@ -1,0 +1,297 @@
+#!/usr/bin/perl
+#################################################
+# Squid Arms and Tentacles: Blacklists (version 1.0)
+#
+# Looks up a URL in the database to see if it's blocked
+#        Mike A. Leonetti
+#          2012-08-2
+#
+# http://www.mikealeonetti.com/wiki/index.php/Squid_Arms_and_Tentacles:_Blacklists
+#
+# Copyright (c) 2012 Mike A. Leonetti
+# All rights reserved.
+#
+# This package is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#################################################
+
+use strict;
+use DBI;
+
+#use Data::Dumper;
+
+use URI::URL;
+use Getopt::Std;
+use Pod::Usage;
+
+$|=1;
+
+## MySQL info
+my $mysql_host = 'localhost';
+my $mysql_user = 'squidaccess';
+my $mysql_pass = 'squidaccess';
+my $mysql_db = 'squidaccess';
+
+my $query_start = "SELECT `category` FROM `blacklist` WHERE";
+my $query_end = "LIMIT 0, 1;";
+
+## Debug info
+# When set to 1 will output to /tmp/receivedurls
+my $debug = 1;
+
+##
+# Start
+##
+#Categories array
+my @categories = ();
+# Get the optinos
+my %opts = ();
+getopts( 'wf:?', \%opts )
+	or pod2usage( -exitstatus => 1, -verbose => 0 );
+
+pod2usage(-exitstatus => 0, -verbose => 2) if( $opts{'?'} );
+
+# Check for the whitelist option
+my $is_whitelist = 0;
+$is_whitelist = 1 if( $opts{'w'} );
+
+# Split the URL
+#$url =~ /^((http[s]?|ftp):\/)?\/?([^:\/\s]+)((\/\w+)*\/)([\w\-\.]+[^#?\s]+)(.*)?(#[\w\-]+)?$/;
+
+# Try to grab the categories from the options (the hyphen ones)
+if( $opts{'f'} )
+{
+	# This should be a file. Does it exist?
+	die( "Categories file provided does not exist!" ) unless( -e $opts{'f'} );
+
+	# Try to open the file
+	open( my $optionsfile, '<', $opts{'f'} )
+		or die( "Could not open the categories file." );
+	
+	while( <$optionsfile> )
+	{
+		# Trim
+		s/^\s*//;
+		s/\s*$//;
+
+		# Is there still something?
+		next unless( $_ );
+
+		# Add the categories (all lowercase)
+		push( @categories, lc( $_ ) );
+	}
+
+	close( $optionsfile );
+}
+else
+{
+	# Grab the category list from the ARGV (command line aft'r the hyphen options)
+	my $argv_categories = $ARGV[0];
+
+	pod2usage( -exitstatus => 1, -verbose => 0 ) unless( $argv_categories );
+
+	# Map it into the array all lower case
+	@categories = map { lc( $_ ) } split( /,/, $argv_categories );
+}
+
+my $categories_where = '';
+foreach( @categories )
+{
+	$categories_where.= " OR " if( $categories_where );
+	$categories_where.= "`category`='".$_."'";
+}
+
+while( <STDIN> )
+{
+	# Do some trimming
+	s/^\s*//;
+	s/\s*$//;
+	my $url = $_;
+
+	open( my $debugfile, ">>", "/tmp/receivedurls" ) if( $debug );
+	printf( $debugfile "Requested URL: %s\n", $url ) if( $debug );
+	#print( "OK\n" );
+	#next;
+
+# Database connect
+my $db_handle = DBI->connect( "dbi:mysql:$mysql_db;$mysql_host", $mysql_user, $mysql_pass )
+	or die $DBI::errstr;
+
+# Get the proto
+#
+# This fixes a previous bug where Squid would send URLs like twitter.com:443 that would crash the program
+# Thanks to Igor Neves <igor@3gnt.net> for reporting this
+#
+if( $url=~m!^([^:]*)://! )
+{
+	my $proto = lc( $1 );
+	# We can only handle HTTP or HTTPS so far
+	unless( $proto eq 'http' or $proto eq 'https' )
+	{
+		print( $debugfile "Unhandled protocol $proto\n" ) if( $debug );
+		print( $debugfile "OK\n" ) if( $debug );
+		print( "OK\n" );
+		next;
+	}
+}
+# Since the URL parts module is so touchy, let's make sure we have a complete URL
+else
+{
+	# Check to see if it's SSL sneaking in
+	if( $url=~/:443[!\d]?/ )
+	{
+		# Append the https://
+		$url = "https://".$url;
+	}
+	else
+	{
+		print( $debugfile "Cannot figure out protocol of $url\n" ) if( $debug );
+		print( $debugfile "OK\n" ) if( $debug );
+		print( "OK\n" );
+		next;
+	}
+}
+
+printf( $debugfile "Transformed URL: %s\n", $url ) if( $debug );
+
+# Now get the URL parts
+my $parts = url( $url );
+
+#printf( "--\n%s's identity is\n--\nScheme: %s\nNetloc: %s\nPath: %s\nParams: %s\nQuery: %s\nFrag: %s\n",
+#	$url, $parts->scheme(), $parts->netloc(), $parts->path(), $parts->params(), $parts->query(), $parts->frag() );
+#exit( 0 );
+
+unless( $parts )
+{
+	print( "ERR message=Error reading URL\n" );
+	print( $debugfile "ERR message=Error reading URL\n" ) if( $debug );
+	next;
+}
+
+
+my $netloc = $parts->netloc();
+my $path = $parts->path();
+my $host = $parts->host();
+my $query = $parts->query();
+#my $port = $parts->port(); The port really won't matter
+
+# Get the parent domain and the last three digits (what's that called again?)
+my $three_letters = '';
+my $parent_domain = '';
+
+if( $host=~/([^.]*).([^.]*)$/ )
+{
+	$three_letters = $2;
+	$parent_domain = $1.'.'.$2;
+}
+
+my %url_query_array = ();
+
+# Remove the trailing slash on the path
+$path=~s/\/*$//;
+
+$url_query_array{ $three_letters } = 'd' if( $three_letters );
+$url_query_array{ $host } = 'd' if( $host );
+$url_query_array{ $parent_domain } = 'd' if( $parent_domain and $host ne $parent_domain );
+if( $path )
+{
+	$url_query_array{ $host.$path } = 'u';
+	$url_query_array{ $parent_domain.$path } = 'u';
+}
+if( $query )
+{
+	$url_query_array{ $host.$path.'?'.$query } = 'u';
+	$url_query_array{ $parent_domain.$path.'?'.$query } = 'u';
+}
+
+# Build the final query
+my $url_query = '';
+
+foreach( keys %url_query_array )
+{
+	$url_query.= " OR " if( $url_query );
+	$url_query.= "(`type`='".$url_query_array{ $_ }."' AND `url`='".$_."')";
+}
+
+$query = sprintf( "%s (%s) AND (%s) %s", $query_start, $categories_where, $url_query, $query_end );
+printf( $debugfile "Query: %s\n", $query ) if( $debug );
+
+#print( "$query\n" );
+
+my $th = $db_handle->prepare( $query );
+$th->execute();
+
+my @result = $th->fetchrow_array();
+
+if( defined($result[0]) )
+{
+	if( $is_whitelist )
+	{
+		print( "OK\n" );
+		print( $debugfile "OK\n" ) if( $debug );
+	}
+	else
+	{
+		printf( "ERR message=\"URL found in category %s\"\n", $result[0] );
+		printf( $debugfile "ERR message=\"URL found in category %s\"\n", $result[0] ) if( $debug );
+	}
+}
+else
+{
+	if( $is_whitelist )
+	{
+		print( "ERR message=Site not in any whitelisted category.\n" );
+		print( $debugfile "ERR message=Site not in any whitelisted category.\n" ) if( $debug );
+	}
+	else
+	{
+		print( "OK\n" );
+		print( $debugfile "OK\n" ) if( $debug );
+	}
+}
+
+$th->finish();
+	close( $debugfile ) if( $debug );
+
+# Close the database handle
+$db_handle->disconnect();
+}
+
+__END__
+
+=head1 NAME
+
+url_lookup - Look up URLs based on categories supplied to the script.
+
+=head1 SYNOPSIS
+
+url_lookup [categories]
+
+OR
+
+url_lookup -f [/path/to/categories/file]
+
+ Categories: A comma separated list of the categories to look up without spaces.
+ Options:
+   -f               Alternate path to a file containing categories.
+   -w               Whitelist option
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-f>
+
+Specify this option instead of categories directly on the command line. It should contain a path to a flat text file with a single category on each line.
+
+=item B<-w>
+
+Set the flag "whitelist" which does the opposite of blacklisting. With this option set categories selected will be allowed and not denied.
+
+=back
+
+=head1 NOTE
+
+This script is designed to be called directly by Squid. Please only call this script manually in a testing scenario.
+
+=cut

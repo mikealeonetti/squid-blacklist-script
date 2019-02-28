@@ -1,0 +1,232 @@
+#!/usr/bin/perl
+#################################################
+# Squid Arms and Tentacles: Blacklists (version 1.0)
+#
+# Read data from urlblacklist.com and merge the changes into tables
+#        Mike A. Leonetti
+#          2012-07-30
+# 
+# http://www.mikealeonetti.com/wiki/index.php/Squid_Arms_and_Tentacles:_Blacklists
+#
+# Copyright (c) 2012 Mike A. Leonetti
+# All rights reserved.
+#
+# This package is free software; you can redistribute it and/or
+# modify it under the same terms as Perl itself.
+#################################################
+
+use strict;
+use DBI;
+use File::Path;
+
+sub table_exists($);
+
+## Directory of the URL black list
+my $blacklist_temp = "/tmp/blacklists/";
+my $save_file = "/tmp/blacklist.tar.gz";
+my $extract_path = "/tmp";
+
+# The URL to obtain it from
+my $blacklist_url = "http://urlblacklist.com/cgi-bin/commercialdownload.pl?type=download&file=bigblacklist";
+#my $blacklist_url = "http://urlblacklist.com/cgi-bin/commercialdownload.pl?type=download&file=smalltestlist";
+
+## MySQL info
+my $mysql_host = 'localhost';
+my $mysql_user = 'squidaccess';
+my $mysql_pass = 'squidaccess';
+my $mysql_db = 'squidaccess';
+
+# Check URL
+# DESCRIBE SELECT * FROM `temp` WHERE (`category`='pets' OR `category`='sect') AND (`url`='1800jeffers.com' AND `type`='d') OR (`url`='1800jeffers.com/ssc/' AND `type`='u');
+# SELECT 1 FROM `temp` WHERE (`category`='pets' OR `category`='sect') AND (`url`='1800jeffers.com' AND `type`='d') OR (`url`='1800jeffers.com/ssc/' AND `type`='u') LIMIT 0, 1;
+# RENAME TABLE `blacklist` TO `old_blacklist`, `temp` TO `blacklist`;
+
+##
+# Setup
+##
+#Add the trailing slash
+$blacklist_temp =~ s!/*$!/!;
+# The files to merge and their associations (as in d for domains and u for urls)
+my %files_to_merge = ( 'd', 'domains', 'u', 'urls' );
+# For creating tables
+my $create_table_statement = <<EOF;
+CREATE TABLE IF NOT EXISTS `%s` (
+  `url` varbinary(2000) NOT NULL,
+  `category` varbinary(64) NOT NULL,
+  `type` binary(1) NOT NULL,
+  PRIMARY KEY (`url`(256)),
+  KEY `category` (`category`),
+  KEY `type` (`type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+EOF
+
+# The max number of insets at a time
+my $max_extended_inserts = 20000;
+
+# For inserting data
+my $insert_query_statement = "INSERT IGNORE INTO `%s` (`url`, `category`, `type`) VALUES ";
+my $insert_query_values = "(%s,%s,%s)";
+my $insert_query_end = ";";
+# For dropping tables
+my $drop_table_statement = "DROP TABLE IF EXISTS `%s`;";
+# Table names
+my $temp_table_name = "temp";
+my $live_table_name = "blacklist";
+my $old_table_name = "blacklist_old";
+# Copy table statement
+my $copy_table_statement = "INSERT IGNORE INTO `%s` SELECT * FROM `%s`;";
+# Delete statement if not in other table
+my $delete_row_statement = "DELETE FROM `%s` WHERE NOT EXISTS (SELECT * FROM `%s` WHERE `%s`.`url`=`%s`.`url` LIMIT 0, 1);";
+# The rename table query
+my $rename_table_statement = "RENAME TABLE `%s` TO `%s`;";
+# To turn unique checks off
+my $begin_statements = "SET autocommit=0;";
+my $end_statements = "COMMIT;";
+
+##
+# Start
+##
+# Delete old files
+unlink( $save_file );
+rmtree( $blacklist_temp );
+
+# Download the file using wget and other system functions
+system( qq/wget "$blacklist_url" -O $save_file/ )==0
+	or die "Could not download blacklist: $?";
+# Now untar
+system( qq/tar xvf $save_file -C $extract_path/ )==0
+	or die "Couldn't extract blacklist: $?";
+
+
+# Database connect
+my $db_handle = DBI->connect( "dbi:mysql:$mysql_db;$mysql_host", $mysql_user, $mysql_pass )
+	or die $DBI::errstr;
+
+## Get all directories inside directory
+opendir( my $directory_search, $blacklist_temp )
+	or die "Cannot open directory: $!";
+
+$db_handle->do( $begin_statements );
+
+# Make sure the temp table is deleted
+$db_handle->do( sprintf($drop_table_statement, $temp_table_name) );
+
+# Create the temp table
+$db_handle->do( sprintf($create_table_statement, $temp_table_name) );
+
+# To build the extended query
+my $data_count=0;
+my $query_append="";
+
+while( my $directory = readdir( $directory_search ) )
+{
+	# Make sure we are using the current directory or previous directory
+	next if( $directory eq '.' or $directory eq '..' );
+	
+	# Make the path full
+	my $directory_with_path = $blacklist_temp.$directory;
+
+	# Make sure it's a directory
+	next unless( -d $directory_with_path );
+
+	# Make sure we don't have any slashes on this variable
+	my $no_slash_directory = $directory;
+	$no_slash_directory =~ s!/$!!;
+
+	# Add a slash to the end of the directory for concatenation
+	$directory_with_path =~ s|/*$|/|;
+
+	# Merge both URLS and DOMAINS
+	# Create the table if it doesn't exist
+	for my $type( keys %files_to_merge )
+	{
+		my $file = $files_to_merge{ $type };
+		my $file_with_path = $directory_with_path.$file;
+
+		# Does the file actually exist?
+		next unless( -f $file_with_path );
+
+		# Read the file
+		open( my $filehandle, '<', $file_with_path )
+			or die "Can't open $file_with_path: $!";
+
+		printf( "Moving in type %s for %s\n", $type, $directory );
+
+		while( <$filehandle> )
+		{
+			# Clean the beginning spaces and dots
+			# Also clean the trailing slash and spaces
+			s/\s*$//;
+			s/^\s*//;
+			s/^\.*//;
+			s/\/*$//;
+
+			#print "$_\n";
+			# See if we have to start a new query
+			if( $data_count>$max_extended_inserts )
+			{
+				# Commit the old query
+				$db_handle->do( $query_append.$insert_query_end );
+				# Reset all variables
+				$data_count=0;
+				$query_append="";
+			}
+
+			# Start the query off if we have to again
+			if( !$query_append )
+			{
+				$query_append = sprintf( $insert_query_statement, $temp_table_name );
+			}
+
+			# Add a comma as necessary
+			$query_append.= "," if( $data_count );
+
+			# Now append the stuff
+			$query_append.= sprintf( $insert_query_values, $db_handle->quote( $_ ), $db_handle->quote( $directory ), $db_handle->quote( $type ) );
+			
+			$data_count++;
+		}
+
+		close( $filehandle );
+	}
+}
+
+# Shall we commit the last query?
+$db_handle->do( $query_append.$insert_query_end )
+	if( $query_append );
+
+# Close the directory handle
+closedir( $directory_search );
+
+# Shift tables
+# Delete old table
+$db_handle->do( sprintf($drop_table_statement, $old_table_name) );
+
+# Shift the new table around
+if( table_exists( $live_table_name ) )
+{
+	$db_handle->do( sprintf($rename_table_statement, $live_table_name, $old_table_name) );
+}
+$db_handle->do( sprintf($rename_table_statement, $temp_table_name, $live_table_name) );
+
+
+$db_handle->do( $end_statements );
+
+# Close the database handle
+$db_handle->disconnect();
+
+# Delete temp files
+unlink( $save_file );
+rmtree( $blacklist_temp );
+
+sub table_exists($)
+{
+	my $table = shift;
+	my $sth = $db_handle->prepare( "SELECT 1 FROM `$table`;" );
+	my $rv = $sth->execute();
+
+	return( 1 ) if( $rv );
+
+	return( 0 );
+
+}
